@@ -87,19 +87,6 @@ func TestContextFormFile(t *testing.T) {
 	assert.NoError(t, c.SaveUploadedFile(f, "test"))
 }
 
-func TestContextFormFileFailed(t *testing.T) {
-	buf := new(bytes.Buffer)
-	mw := multipart.NewWriter(buf)
-	mw.Close()
-	c, _ := CreateTestContext(httptest.NewRecorder())
-	c.Request, _ = http.NewRequest("POST", "/", nil)
-	c.Request.Header.Set("Content-Type", mw.FormDataContentType())
-	c.engine.MaxMultipartMemory = 8 << 20
-	f, err := c.FormFile("file")
-	assert.Error(t, err)
-	assert.Nil(t, f)
-}
-
 func TestContextMultipartForm(t *testing.T) {
 	buf := new(bytes.Buffer)
 	mw := multipart.NewWriter(buf)
@@ -1018,9 +1005,7 @@ func TestContextRenderFile(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), "func New() *Engine {")
-	// Content-Type='text/plain; charset=utf-8' when go version <= 1.16,
-	// else, Content-Type='text/x-go; charset=utf-8'
-	assert.NotEqual(t, "", w.Header().Get("Content-Type"))
+	assert.Equal(t, "text/plain; charset=utf-8", w.Header().Get("Content-Type"))
 }
 
 func TestContextRenderFileFromFS(t *testing.T) {
@@ -1032,9 +1017,7 @@ func TestContextRenderFileFromFS(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), "func New() *Engine {")
-	// Content-Type='text/plain; charset=utf-8' when go version <= 1.16,
-	// else, Content-Type='text/x-go; charset=utf-8'
-	assert.NotEqual(t, "", w.Header().Get("Content-Type"))
+	assert.Equal(t, "text/plain; charset=utf-8", w.Header().Get("Content-Type"))
 	assert.Equal(t, "/some/path", c.Request.URL.Path)
 }
 
@@ -1048,7 +1031,7 @@ func TestContextRenderAttachment(t *testing.T) {
 
 	assert.Equal(t, 200, w.Code)
 	assert.Contains(t, w.Body.String(), "func New() *Engine {")
-	assert.Equal(t, fmt.Sprintf("attachment; filename=\"%s\"", newFilename), w.Header().Get("Content-Disposition"))
+	assert.Equal(t, fmt.Sprintf("attachment; filename=\"%s\"", newFilename), w.HeaderMap.Get("Content-Disposition"))
 }
 
 // TestContextRenderYAML tests that the response is serialized as YAML
@@ -1428,13 +1411,17 @@ func TestContextClientIP(t *testing.T) {
 	c.engine.RemoteIPHeaders = []string{"X-Forwarded-For"}
 	assert.Equal(t, "40.40.40.40", c.ClientIP())
 
+	// Disabled TrustedProxies feature
+	_ = c.engine.SetTrustedProxies(nil)
+	assert.Equal(t, "40.40.40.40", c.ClientIP())
+
 	// Last proxy is trusted, but the RemoteAddr is not
 	_ = c.engine.SetTrustedProxies([]string{"30.30.30.30"})
 	assert.Equal(t, "40.40.40.40", c.ClientIP())
 
 	// Only trust RemoteAddr
 	_ = c.engine.SetTrustedProxies([]string{"40.40.40.40"})
-	assert.Equal(t, "20.20.20.20", c.ClientIP())
+	assert.Equal(t, "30.30.30.30", c.ClientIP())
 
 	// All steps are trusted
 	_ = c.engine.SetTrustedProxies([]string{"40.40.40.40", "30.30.30.30", "20.20.20.20"})
@@ -1473,8 +1460,20 @@ func TestContextClientIP(t *testing.T) {
 	c.engine.TrustedPlatform = PlatformGoogleAppEngine
 	assert.Equal(t, "50.50.50.50", c.ClientIP())
 
-	// Test the legacy flag
+	// Use custom TrustedPlatform header
+	c.engine.TrustedPlatform = "X-CDN-IP"
+	c.Request.Header.Set("X-CDN-IP", "80.80.80.80")
+	assert.Equal(t, "80.80.80.80", c.ClientIP())
+	// wrong header
+	c.engine.TrustedPlatform = "X-Wrong-Header"
+	assert.Equal(t, "40.40.40.40", c.ClientIP())
+
+	c.Request.Header.Del("X-CDN-IP")
+	// TrustedPlatform is empty
 	c.engine.TrustedPlatform = ""
+	assert.Equal(t, "40.40.40.40", c.ClientIP())
+
+	// Test the legacy flag
 	c.engine.AppEngine = true
 	assert.Equal(t, "50.50.50.50", c.ClientIP())
 	c.engine.AppEngine = false
@@ -2056,57 +2055,4 @@ func TestRemoteIPFail(t *testing.T) {
 	ip, trust := c.RemoteIP()
 	assert.Nil(t, ip)
 	assert.False(t, trust)
-}
-
-func TestContextWithFallbackValueFromRequestContext(t *testing.T) {
-	tests := []struct {
-		name             string
-		getContextAndKey func() (*Context, interface{})
-		value            interface{}
-	}{
-		{
-			name: "c with struct context key",
-			getContextAndKey: func() (*Context, interface{}) {
-				var key struct{}
-				c := &Context{}
-				c.Request, _ = http.NewRequest("POST", "/", nil)
-				c.Request = c.Request.WithContext(context.WithValue(context.TODO(), key, "value"))
-				return c, key
-			},
-			value: "value",
-		},
-		{
-			name: "c with string context key",
-			getContextAndKey: func() (*Context, interface{}) {
-				c := &Context{}
-				c.Request, _ = http.NewRequest("POST", "/", nil)
-				c.Request = c.Request.WithContext(context.WithValue(context.TODO(), "key", "value"))
-				return c, "key"
-			},
-			value: "value",
-		},
-		{
-			name: "c with nil http.Request",
-			getContextAndKey: func() (*Context, interface{}) {
-				c := &Context{}
-				return c, "key"
-			},
-			value: nil,
-		},
-		{
-			name: "c with nil http.Request.Context()",
-			getContextAndKey: func() (*Context, interface{}) {
-				c := &Context{}
-				c.Request, _ = http.NewRequest("POST", "/", nil)
-				return c, "key"
-			},
-			value: nil,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c, key := tt.getContextAndKey()
-			assert.Equal(t, tt.value, c.Value(key))
-		})
-	}
 }
